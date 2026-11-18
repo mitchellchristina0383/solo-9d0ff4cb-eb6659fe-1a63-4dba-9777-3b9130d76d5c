@@ -1,0 +1,17 @@
+services:
+  cache:
+    build: .
+    image: build-artifact-cache
+    ports:
+      - "8000:8000"
+    environment:
+      TOKEN_TTL_SECONDS: "300"        # lease token lifetime
+      MAX_UPLOAD_BYTES: "1048576"     # 1 MiB hard limit
+      SWEEP_INTERVAL_SECONDS: "30"    # background recovery sweep
+      ORPHAN_GRACE_SECONDS: "60"
+    volumes:
+      - cache-data:/data              # SQLite db + artifact files survive restarts
+    restart: unless-stopped
+
+volumes:
+  cache-data:
