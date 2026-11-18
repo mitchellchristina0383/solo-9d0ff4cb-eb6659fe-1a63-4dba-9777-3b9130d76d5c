@@ -76,6 +76,28 @@ class ReleaseOut(BaseModel):
     released: bool
 
 
+class AvailabilityChangeOut(BaseModel):
+    seq: int = Field(description="Monotonic, gap-free event id (the cursor)")
+    number: str
+    generation: int
+    status: str = Field(
+        description="available: upload committed; invalidated: superseded by "
+        "a re-upload or selected for reclaim; released: file actually removed"
+    )
+    changed_at: float
+
+
+class AvailabilityChangesOut(BaseModel):
+    changes: list[AvailabilityChangeOut]
+    next_cursor: int = Field(
+        description="Pass this back as ?cursor= to resume; equals the request "
+        "cursor when no new events exist"
+    )
+    has_more: bool = Field(
+        description="True when at least one further event remains past this page"
+    )
+
+
 # ------------------------------------------------------------------------- app
 
 
@@ -125,7 +147,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             "Content-addressed cache for CI build artifacts. Uploads are "
             "SHA-256 verified and capped at 1 MiB. Downloads require a "
             "time-limited lease token. Reclamation frees LRU, unoccupied "
-            "artifacts first."
+            "artifacts first. GET /availability/changes offers a "
+            "cursor-resumable feed of per-generation availability "
+            "transitions (available / invalidated / released)."
         ),
         lifespan=lifespan,
     )
@@ -286,6 +310,28 @@ def create_app(config: Config | None = None) -> FastAPI:
     )
     def admin_sweep():
         return store.sweep()
+
+    # ------------------------------------------------- availability changes
+
+    @app.get(
+        "/availability/changes",
+        response_model=AvailabilityChangesOut,
+        summary="Cursor-paged availability change feed (resumable, no gaps/dupes)",
+    )
+    def availability_changes(
+        cursor: int = Query(
+            default=0,
+            ge=0,
+            description="Last seen seq; only events with seq > cursor are returned",
+        ),
+        limit: int = Query(
+            default=Store.DEFAULT_CHANGE_LIMIT,
+            ge=1,
+            le=Store.MAX_CHANGE_LIMIT,
+            description="Maximum events per page",
+        ),
+    ):
+        return store.availability_changes(cursor, limit)
 
     @app.get("/stats", summary="Cache statistics")
     def stats():

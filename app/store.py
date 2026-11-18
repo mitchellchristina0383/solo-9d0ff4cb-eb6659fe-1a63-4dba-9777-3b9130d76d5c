@@ -17,6 +17,15 @@ Design notes
   deletion fails, the row stays in ``reclaiming`` and is retried by the
   next reclaim call, the background sweeper, or the startup sweep after a
   process restart.
+* Every availability transition is appended to the
+  ``availability_changes`` log inside the same transaction as the state
+  change it describes. An upload records ``invalidated`` for the displaced
+  generation plus ``available`` for the new one atomically; reclaim
+  selection records ``invalidated``; a generation is recorded
+  ``released`` only once its file is actually gone (successful unlink or
+  confirmed already absent), never on a deletion failure. The monotonic
+  ``seq`` cursor lets schedulers resume reading without gaps or
+  duplicates, even across a process restart.
 """
 
 from __future__ import annotations
@@ -54,6 +63,26 @@ CREATE TABLE IF NOT EXISTS tokens (
 
 CREATE INDEX IF NOT EXISTS idx_tokens_active
     ON tokens(number, generation, released, expires_at);
+
+-- Append-only availability event log. Every row is one state transition of
+-- a specific (number, generation); ``seq`` is a monotonically increasing
+-- cursor assigned in commit order, so clients can resume polling without
+-- losing or re-reading a committed change. Rows are never updated or
+-- deleted; the same generation may legitimately appear more than once
+-- (e.g. invalidated by reclaim selection, then invalidated again when a
+-- same-number re-upload supersedes it), while 'released' is guarded to be
+-- recorded at most once per generation.
+CREATE TABLE IF NOT EXISTS availability_changes (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    number      TEXT NOT NULL,
+    generation  INTEGER NOT NULL,
+    status      TEXT NOT NULL
+                CHECK (status IN ('available', 'invalidated', 'released')),
+    changed_at  REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_availability_number_gen
+    ON availability_changes(number, generation);
 """
 
 # SQL fragment: an active (unreleased, unexpired) token pinning this exact
@@ -115,6 +144,31 @@ class Store:
     def _abs(self, rel_path: str) -> str:
         return os.path.join(self.storage_dir, rel_path)
 
+    def _record_change(
+        self, db: sqlite3.Connection, number: str, generation: int,
+        status: str, now: float,
+    ) -> None:
+        """Append an availability event. Caller must hold an open txn so the
+        event commits atomically with the state transition it describes."""
+        db.execute(
+            "INSERT INTO availability_changes(number, generation, status, "
+            "changed_at) VALUES (?,?,?,?)",
+            (number, generation, status, now),
+        )
+
+    def _record_released_once(
+        self, db: sqlite3.Connection, number: str, generation: int, now: float
+    ) -> None:
+        """Record 'released' at most once per generation. The NOT EXISTS
+        guard makes sweep/reclaim retries idempotent across restarts."""
+        db.execute(
+            "INSERT INTO availability_changes(number, generation, status, "
+            "changed_at) SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM "
+            "availability_changes WHERE number=? AND generation=? "
+            "AND status='released')",
+            (number, generation, "released", now, number, generation),
+        )
+
     def close(self) -> None:
         with self.lock:
             self.conn.close()
@@ -131,6 +185,10 @@ class Store:
         The file is written to a unique per-upload path before the row is
         committed, so a crash leaves at worst an orphan file (swept later),
         never a row pointing at missing content created by *this* upload.
+        Generation numbers are monotonic per artifact number across the
+        whole cache lifetime, including after a full reclaim, so a
+        generation is never reused (see the availability_changes high-water
+        mark below).
         """
         now = self._now()
         with self.lock:
@@ -139,7 +197,21 @@ class Store:
                     "SELECT generation, file_path FROM artifacts WHERE number=?",
                     (number,),
                 ).fetchone()
-                generation = (row["generation"] + 1) if row else 1
+                if row is not None:
+                    generation = row["generation"] + 1
+                else:
+                    # The row may be gone after a full reclaim, but the
+                    # append-only event log retains every generation this
+                    # number ever used. Generations are therefore monotonic
+                    # for the lifetime of the cache and never reused, so a
+                    # scheduler can always tell a stale generation from a
+                    # later same-number upload.
+                    hwm = db.execute(
+                        "SELECT COALESCE(MAX(generation), 0) AS g "
+                        "FROM availability_changes WHERE number=?",
+                        (number,),
+                    ).fetchone()["g"]
+                    generation = hwm + 1
                 old_path = row["file_path"] if row else None
 
                 rel = f"{number}/{generation:08d}-{uuid.uuid4().hex}.bin"
@@ -175,6 +247,17 @@ class Store:
                     """,
                     (number, generation, sha256, len(data), rel, now, now),
                 )
+                if row is not None:
+                    # Same-number re-upload: the displaced generation becomes
+                    # invalid and the new one available *in the same commit*,
+                    # so a reader can never observe one without the other.
+                    # This is unconditional: an already-reclaiming (and thus
+                    # already-invalidated) old generation must still be
+                    # marked invalid by the superseding upload itself.
+                    self._record_change(
+                        db, number, row["generation"], "invalidated", now
+                    )
+                self._record_change(db, number, generation, "available", now)
                 # NB: tokens pinned to older generations are left in place;
                 # they can never match the new generation (download -> 409,
                 # renew -> 409) and are cleaned up once they expire.
@@ -515,18 +598,25 @@ class Store:
 
         The conditional UPDATE re-checks occupancy and readiness, so an
         artifact that gained a token since the candidate query is skipped.
-        Once marked 'reclaiming', no new tokens can be issued for it.
+        Once marked 'reclaiming', no new tokens can be issued for it. The
+        'invalidated' event is committed in the same transaction as the
+        state flip, so a crash can never leave a flipped row without its
+        event or an event without its flip.
         """
-        cur = self.conn.execute(
-            f"""
-            UPDATE artifacts SET state='reclaiming'
-            WHERE number=? AND generation=? AND state='ready'
-              AND NOT {_ACTIVE_TOKEN}
-            """,
-            (row["number"], row["generation"], now),
-        )
-        if cur.rowcount == 0:
-            return "skipped", 0
+        with self._txn() as db:
+            cur = db.execute(
+                f"""
+                UPDATE artifacts SET state='reclaiming'
+                WHERE number=? AND generation=? AND state='ready'
+                  AND NOT {_ACTIVE_TOKEN}
+                """,
+                (row["number"], row["generation"], now),
+            )
+            if cur.rowcount == 0:
+                return "skipped", 0
+            self._record_change(
+                db, row["number"], row["generation"], "invalidated", now
+            )
         return self._delete_marked_locked(
             row["number"], row["generation"], row["size"], row["file_path"]
         )
@@ -537,10 +627,14 @@ class Store:
         """Delete the file of a 'reclaiming' row, then the row itself.
 
         On file-deletion failure the row stays in 'reclaiming' so the
-        sweeper / next reclaim / startup recovery retries it. The row delete
-        is conditional on (number, generation, reclaiming): if the artifact
-        was re-uploaded meanwhile, the new row and its new file are left
-        untouched.
+        sweeper / next reclaim / startup recovery retries it. No
+        'released' event is written until the deletion actually succeeds,
+        so a failed unlink can never announce a release that did not
+        happen. The row delete is conditional on (number, generation,
+        reclaiming): if the artifact was re-uploaded meanwhile, the new
+        row and its new file are left untouched and no release is
+        recorded for the displaced generation, whose availability is now
+        governed by the superseding upload's own events.
         """
         try:
             os.remove(self._abs(file_path))
@@ -549,12 +643,18 @@ class Store:
             deleted = False  # already gone; still drop the stale record
         except OSError as exc:
             return "failed", f"{type(exc).__name__}: {exc}"
+        now = self._now()
         with self._txn() as db:
-            db.execute(
+            cur = db.execute(
                 "DELETE FROM artifacts WHERE number=? AND generation=? "
                 "AND state='reclaiming'",
                 (number, generation),
             )
+            if cur.rowcount > 0:
+                # Recorded in the same commit as the row removal; the
+                # NOT EXISTS guard keeps restart/sweep retries from ever
+                # emitting a duplicate 'released' for this generation.
+                self._record_released_once(db, number, generation, now)
             db.execute(
                 "DELETE FROM tokens WHERE number=? AND generation=?",
                 (number, generation),
@@ -611,6 +711,51 @@ class Store:
                 "orphans_removed": orphans_removed,
                 "errors": errors,
             }
+
+    # ------------------------------------------------- availability changes
+
+    MAX_CHANGE_LIMIT = 1000
+    DEFAULT_CHANGE_LIMIT = 100
+
+    def availability_changes(self, cursor: int, limit: int) -> dict:
+        """Return availability events strictly after ``cursor``.
+
+        Reads up to ``limit + 1`` rows so ``has_more`` is decided without a
+        separate count query. The returned ``next_cursor`` is the seq of the
+        last row in this page (unchanged, i.e. equal to the request cursor,
+        when the page is empty), so a client that polls with it resumes
+        exactly at the next commit: no gap, no re-read of committed rows.
+        """
+        if cursor < 0:
+            raise StoreError(422, "cursor must be >= 0")
+        if limit <= 0:
+            raise StoreError(422, "limit must be > 0")
+        if limit > self.MAX_CHANGE_LIMIT:
+            raise StoreError(422, f"limit must be <= {self.MAX_CHANGE_LIMIT}")
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT seq, number, generation, status, changed_at "
+                "FROM availability_changes WHERE seq > ? "
+                "ORDER BY seq ASC LIMIT ?",
+                (cursor, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        page = [
+            {
+                "seq": r["seq"],
+                "number": r["number"],
+                "generation": r["generation"],
+                "status": r["status"],
+                "changed_at": r["changed_at"],
+            }
+            for r in rows[:limit]
+        ]
+        next_cursor = page[-1]["seq"] if page else cursor
+        return {
+            "changes": page,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
 
     # ------------------------------------------------------------------ stats
 

@@ -30,6 +30,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirement
 | `POST` | `/tokens/{token}/renew` | 续期一个 TTL（已过期/已释放/产物变更均 409） |
 | `POST` | `/tokens/{token}/release` | 完成后释放（幂等） |
 | `POST` | `/reclaim` | 输入 `target_bytes`，LRU 优先回收未占用产物，返回实际 `freed_bytes` |
+| `GET` | `/availability/changes?cursor=&limit=` | **可用性变更游标流**：返回 `seq > cursor` 的事件，按提交顺序、无漏无重，可断点续领 |
 | `POST` | `/admin/sweep` | 手动触发恢复清扫（中断的回收、孤儿文件） |
 | `GET` | `/stats` / `/health` | 统计 / 健康检查 |
 
@@ -56,13 +57,50 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirement
   交错在进程内无竞态（WAL、显式 `BEGIN IMMEDIATE` 保证崩溃原子性）。多副本
   水平扩展不在本设计范围内。
 
+## 可用性变更流（游标续领）
+
+调度器离线后可能重传产物或回收空间，待执行构建会引用已失效代际。
+`GET /availability/changes` 用只追加表 `availability_changes` 暴露每个
+`(number, generation)` 的状态变迁，`seq` 为自增主键、即单调游标：
+
+| 状态 | 含义 | 何时写入（与状态变更同一事务提交） |
+|---|---|---|
+| `available` | 该代际成功上传、可用 | 每次 `PUT /artifacts` |
+| `invalidated` | 该代际已失效，构建不应再引用 | 同号重传取代旧代际；或回收被选中（行翻转为 `reclaiming`） |
+| `released` | 文件已实际从磁盘移除、空间释放 | 仅在删盘成功（或确认本就不存在）并条件删行后 |
+
+关键保证：
+
+- **同次提交**：同号重传在一个事务内写入「旧代 `invalidated` + 新代
+  `available`」，外部不可能只观察到其中一条。
+- **失败不谎报**：删文件失败时行保持 `reclaiming`，**绝不写 `released`**；
+  由下次回收 / 后台清扫 / **重启启动清扫**重试，成功后才补写。
+- **不漏不重**：`released` 带 `NOT EXISTS` 幂等守卫，同一代际最多一条；
+  重启清扫补全时不会漏记也不会重复。
+- **迟到清扫不覆盖新代际**：旧代际的待删条件为
+  `WHERE number=? AND generation=? AND state='reclaiming'`，重传使该条件命中
+  0 行，新代际的行、文件与 `available` 事件均不受影响，也不会给旧代际误记释放。
+- **代际不复用**：即使某产物号被整体回收（行删除），重传仍从事件表取高水位
+  代际 +1，保证 `(number, generation)` 全局唯一，调度器能区分同名新旧代际。
+- **续领语义**：返回 `{changes, next_cursor, has_more}`，客户端把
+  `next_cursor` 作为下次 `cursor` 即可从下一提交精确续读；无新事件时
+  `next_cursor` 等于入参游标（稳定不空转）。`limit ∈ [1,1000]`，非法值 422。
+
 ## 已验证
 
-- 21 项功能测试 + 1 项真实 uvicorn 下的 8 线程并发交错测试（上传/下载/续期/
-  释放/回收混合压力，断言无 5xx、下载内容哈希一致、被持续占用的产物存活）。
-- 失败情形：删文件失败继续清理其余并可恢复、进程重启后完成中断的回收、
-  文件缺失不声称可下载、重传文件不被误删、孤儿文件宽限后清扫。
+- 22 项原有功能测试 + 16 项可用性变更流测试 + 1 项变更流真实 uvicorn 并发测试
+  （上传/重传/领令牌/回收/多页大小游标轮询混合压力，断言 `seq` 为无漏无重的
+  1..N、每代际生命周期合法、无 5xx），合计 39 项全部通过；原 8 线程并发交错
+  测试同样通过，下载与租约行为保持不变。
+- 失败情形：删文件失败继续清理其余并可恢复（且失败期间不产生 `released`）、
+  进程重启后完成中断的回收并补齐唯一一条 `released`、文件缺失不声称可下载、
+  重传文件不被误删、迟到旧代际清扫不影响新代际事件、孤儿文件宽限后清扫。
+- 真实进程冒烟（独立 uvicorn，非 TestClient）：完整走查上传/重传同事务事件、
+  小页游标翻页、强制删盘失败→修复→清扫补全、整体回收后代际不复用、租约下载与
+  旧令牌 409、`/docs` 与 `/openapi.json` 可用；并实测 kill 进程后以同一数据
+  目录重启，启动清扫自动补全事件流、无漏重。
 - 冒烟：uvicorn 直接启动、`/docs` 与 `/openapi.json` 可用、重启后数据存活。
 
-限制：本沙箱无 Docker，`docker compose up` 未实际执行；Compose 使用的命令
-（`uvicorn app.main:app`）与依赖已在本地逐一验证。
+限制：本沙箱无 Docker 守护进程，`docker compose up` 未实际执行；Compose 使用的
+命令（`uvicorn app.main:app`）与依赖已在本地逐一验证，Dockerfile/compose 配置
+未改动，沿用既有可启动结构。
